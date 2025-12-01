@@ -1,0 +1,29 @@
+{
+  "name": "liekodb",
+  "version": "0.0.1",
+  "description": "Lightweight, file-based, MongoDB-like JSON database for Node.js",
+  "main": "liekodb.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "database",
+    "json",
+    "local",
+    "file-based",
+    "mongodb",
+    "lightweight",
+    "nosql",
+    "offline"
+  ],
+  "author": "Eih3 eih3.prog@gmail.com",
+  "license": "MIT",
+  "files": [
+    "liekodb.js",
+    "README.md",
+    "./examples"
+  ],
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}
