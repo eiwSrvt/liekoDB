@@ -419,19 +419,19 @@ class HTTPAdapter {
 
         this.httpAgent = new http.Agent(agentOptions);
         this.httpsAgent = new https.Agent(agentOptions);
-
+        
         const setupSocket = (socket) => {
             socket.setNoDelay(true);
             socket.setKeepAlive(true, 1000);
         };
-
+        
         this.httpAgent.on('socket', setupSocket);
         this.httpsAgent.on('socket', setupSocket);
 
         this.baseHeaders = {
             "Content-Type": "application/json"
         };
-
+        
         if (this.token) {
             this.baseHeaders.Authorization = `Bearer ${this.token}`;
         }
@@ -444,13 +444,13 @@ class HTTPAdapter {
     async _warmupConnection() {
         try {
             const warmupPromises = [];
-
+            
             for (let i = 0; i < 2; i++) {
                 const promise = new Promise((resolve) => {
                     const timer = setTimeout(() => {
                         resolve();
                     }, 100);
-
+                    
                     const req = (this.isHttps ? https : http).request({
                         method: 'HEAD',
                         hostname: this.hostname,
@@ -459,29 +459,29 @@ class HTTPAdapter {
                         agent: this.isHttps ? this.httpsAgent : this.httpAgent,
                         timeout: 100
                     });
-
+                    
                     req.on('error', () => {
                         clearTimeout(timer);
                         resolve();
                     });
-
+                    
                     req.on('response', (res) => {
                         res.resume();
                         clearTimeout(timer);
                         resolve();
                     });
-
+                    
                     req.end();
                 });
-
+                
                 warmupPromises.push(promise);
             }
-
+            
             await Promise.race([
                 Promise.all(warmupPromises),
                 new Promise(resolve => setTimeout(resolve, 200))
             ]);
-        } catch (e) { }
+        } catch (e) {}
     }
 
     async request(method, endpoint, data = {}) {
@@ -519,13 +519,13 @@ class HTTPAdapter {
 
     async _execute(req) {
         const pathname = `/api${req.endpoint}`;
-
+        
         const body = (req.method !== "GET" && req.method !== "HEAD")
             ? JSON.stringify(req.data)
             : null;
 
         const headers = Object.assign({}, this.baseHeaders);
-
+        
         if (body) {
             headers['Content-Length'] = Buffer.byteLength(body);
         }
@@ -575,9 +575,9 @@ class HTTPAdapter {
                     let parsed = raw.toString();
 
                     if (res.headers["content-type"]?.includes("application/json")) {
-                        try {
-                            parsed = JSON.parse(parsed);
-                        } catch (e) { }
+                        try { 
+                            parsed = JSON.parse(parsed); 
+                        } catch (e) {}
                     }
 
                     this._log(req, start, size, res.statusCode);
@@ -738,7 +738,7 @@ class LocalAdapter {
         return Array.from(collections);
     }
 
-    _loadCollection(name) {
+    _getCollection(name) {
         if (this.collections.has(name)) {
             return this.collections.get(name);
         }
@@ -749,32 +749,24 @@ class LocalAdapter {
             lastSave: 0,
             idIndex: new Map()
         };
+        this.collections.set(name, col);
 
         const filePath = path.join(this.storagePath, `${name}.json`);
-
         if (fsSync.existsSync(filePath)) {
             try {
                 const raw = fsSync.readFileSync(filePath, 'utf8');
-                const data = raw.trim() ? JSON.parse(raw) : [];
+                const data = JSON.parse(raw) || [];
+                col.data = data;
 
-                if (Array.isArray(data)) {
-                    col.data = data;
-                    col.idIndex.clear();
-                    for (let i = 0; i < data.length; i++) {
-                        const doc = data[i];
-                        if (doc && doc.id) {
-                            col.idIndex.set(doc.id, i);
-                        }
-                    }
-                }
+                data.forEach((doc, idx) => {
+                    if (doc.id) col.idIndex.set(doc.id, idx);
+                });
 
                 col.lastSave = Date.now();
             } catch (e) {
-                console.error(`[LiekoDB] Critical error loading collection "${name}":`, e.message);
+                console.error("Failed to load collection:", e);
             }
         }
-
-        this.collections.set(name, col);
         return col;
     }
 
@@ -820,12 +812,6 @@ class LocalAdapter {
         } catch (error) {
             this._log('Save error:', error);
             col.dirty = true;
-
-            try {
-                const tempPath = path.join(this.storagePath, `${name}.json.tmp`);
-                if (fsSync.existsSync(tempPath)) fsSync.unlinkSync(tempPath);
-            } catch (e) { }
-
             this._scheduleSave(name);
         } finally {
             this.isSaving.delete(name);
@@ -885,7 +871,7 @@ class LocalAdapter {
 
     async count({ filters = {} } = {}) {
         const start = this._startTimer();
-        const col = this._loadCollection(this.collectionName);
+        const col = this._getCollection(this.collectionName);
         const result = this.queryEngine.count(col.data, filters);
         const duration = this._endTimer(start);
 
@@ -897,7 +883,7 @@ class LocalAdapter {
 
     async find({ filters = {}, options = {} } = {}) {
         const start = this._startTimer();
-        const col = this._loadCollection(this.collectionName);
+        const col = this._getCollection(this.collectionName);
         let results = this.queryEngine.applyFilters(col.data, filters);
 
         if (options.sort) results = this.queryEngine.sortResults(results, options.sort);
@@ -922,10 +908,9 @@ class LocalAdapter {
         return results;
     }
 
-    /*
     async findById(id) {
         const start = this._startTimer();
-        const col = this._loadCollection(this.collectionName);
+        const col = this._getCollection(this.collectionName);
         const found = col.data.find(d => (d.id && d.id === id));
         const duration = this._endTimer(start);
 
@@ -933,33 +918,11 @@ class LocalAdapter {
         this._logRequest('findById', this.collectionName, details, duration, this._getDataSize(found));
 
         return found || null;
-    }*/
-
-    async findById(id) {
-        const start = this._startTimer();
-        const col = this._loadCollection(this.collectionName);
-
-        const idx = col.idIndex.get(id);
-        const found = (idx !== undefined && col.data[idx]) ? col.data[idx] : null;
-
-        const duration = this._endTimer(start);
-        const details = `ID: ${id} | Found: ${found ? 'Yes' : 'No'}`;
-
-        this._logRequest(
-            'findById',
-            this.collectionName,
-            details,
-            duration,
-            this._getDataSize(found)
-        );
-
-        return found;
     }
-
 
     async insert({ data }) {
         const start = this._startTimer();
-        const col = this._loadCollection(this.collectionName);
+        const col = this._getCollection(this.collectionName);
         const toInsert = Array.isArray(data) ? data : [data];
         const now = new Date().toISOString();
         const inserted = [];
@@ -1053,7 +1016,7 @@ class LocalAdapter {
 
     async update({ filters, update }) {
         const start = this._startTimer();
-        const col = this._loadCollection(this.collectionName);
+        const col = this._getCollection(this.collectionName);
 
         const normalizedUpdate = update.$set || update.$inc || update.$push || update.$pull || update.$unset || update.$addToSet
             ? update
@@ -1083,7 +1046,7 @@ class LocalAdapter {
 
     async updateById(id, { update }) {
         const start = this._startTimer();
-        const col = this._loadCollection(this.collectionName);
+        const col = this._getCollection(this.collectionName);
         const docIndex = col.data.findIndex(d => (d.id && d.id === id));
 
         if (docIndex === -1) {
@@ -1149,7 +1112,7 @@ class LocalAdapter {
 
     async delete({ filters = {} }) {
         const start = this._startTimer();
-        const col = this._loadCollection(this.collectionName);
+        const col = this._getCollection(this.collectionName);
         const before = col.data.length;
 
         const idsToDelete = col.data
@@ -1181,7 +1144,7 @@ class LocalAdapter {
 
     async deleteById(id) {
         const start = this._startTimer();
-        const col = this._loadCollection(this.collectionName);
+        const col = this._getCollection(this.collectionName);
         const before = col.data.length;
 
         col.data = col.data.filter(d => !((d.id && d.id === id)));
