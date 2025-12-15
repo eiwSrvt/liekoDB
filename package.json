@@ -1,6 +1,6 @@
 {
   "name": "liekodb",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "description": "Lightweight, file-based, MongoDB-like JSON database for Node.js",
   "main": "liekodb.js",
   "scripts": {
@@ -20,8 +20,7 @@
   "license": "MIT",
   "files": [
     "liekodb.js",
-    "README.md",
-    "./examples"
+    "README.md"
   ],
   "engines": {
     "node": ">=14.0.0"

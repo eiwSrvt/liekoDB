@@ -2,6 +2,10 @@ const fs = require('fs').promises;
 const fsSync = require('fs');
 const path = require('path');
 
+const http = require("http");
+const https = require("https");
+const { URL } = require("url");
+
 class QueryEngine {
     constructor() {
         this.queryCache = new Map();
@@ -35,14 +39,11 @@ class QueryEngine {
 
     matchesFilter(item, filter) {
         if (!filter) return true;
-
-        // Logical operators
         if (filter.$and) return filter.$and.every(f => this.matchesFilter(item, f));
         if (filter.$or) return filter.$or.some(f => this.matchesFilter(item, f));
         if (filter.$nor) return !filter.$nor.some(f => this.matchesFilter(item, f));
         if (filter.$not) return !this.matchesFilter(item, filter.$not);
 
-        // Fields
         for (const key of Object.keys(filter)) {
             if (key.startsWith('$')) continue;
 
@@ -394,6 +395,235 @@ class QueryEngine {
     }
 }
 
+class HTTPAdapter {
+    constructor(opts = {}) {
+        this.poolSize = opts.poolSize || 10;
+        this.requestQueue = [];
+        this.activeRequests = 0;
+        this.maxRetries = opts.maxRetries || 3;
+        this.timeout = opts.timeout || 15000;
+        this.databaseUrl = opts.databaseUrl || "http://127.0.0.1:8050";
+        this.token = opts.token || null;
+        this.parsedBaseUrl = new URL(this.databaseUrl);
+        this.isHttps = this.parsedBaseUrl.protocol === "https:";
+        this.hostname = this.parsedBaseUrl.hostname === 'localhost' ? '127.0.0.1' : this.parsedBaseUrl.hostname;
+
+        const agentOptions = {
+            keepAlive: true,
+            keepAliveMsecs: 1000,
+            maxSockets: this.poolSize,
+            maxFreeSockets: this.poolSize,
+            timeout: this.timeout,
+            scheduling: 'lifo'
+        };
+
+        this.httpAgent = new http.Agent(agentOptions);
+        this.httpsAgent = new https.Agent(agentOptions);
+
+        const setupSocket = (socket) => {
+            socket.setNoDelay(true);
+            socket.setKeepAlive(true, 1000);
+        };
+
+        this.httpAgent.on('socket', setupSocket);
+        this.httpsAgent.on('socket', setupSocket);
+
+        this.baseHeaders = {
+            "Content-Type": "application/json"
+        };
+
+        if (this.token) {
+            this.baseHeaders.Authorization = `Bearer ${this.token}`;
+        }
+
+        if (opts.warmup !== false) {
+            this._warmupConnection();
+        }
+    }
+
+    async _warmupConnection() {
+        try {
+            const warmupPromises = [];
+
+            for (let i = 0; i < 2; i++) {
+                const promise = new Promise((resolve) => {
+                    const timer = setTimeout(() => {
+                        resolve();
+                    }, 100);
+
+                    const req = (this.isHttps ? https : http).request({
+                        method: 'HEAD',
+                        hostname: this.hostname,
+                        port: this.parsedBaseUrl.port,
+                        path: '/ping',
+                        agent: this.isHttps ? this.httpsAgent : this.httpAgent,
+                        timeout: 100
+                    });
+
+                    req.on('error', () => {
+                        clearTimeout(timer);
+                        resolve();
+                    });
+
+                    req.on('response', (res) => {
+                        res.resume();
+                        clearTimeout(timer);
+                        resolve();
+                    });
+
+                    req.end();
+                });
+
+                warmupPromises.push(promise);
+            }
+
+            await Promise.race([
+                Promise.all(warmupPromises),
+                new Promise(resolve => setTimeout(resolve, 200))
+            ]);
+        } catch (e) { }
+    }
+
+    async request(method, endpoint, data = {}) {
+        return new Promise((resolve, reject) => {
+            this._enqueue({ method, endpoint, data, resolve, reject, retries: 0 });
+        });
+    }
+
+    _enqueue(req) {
+        this.requestQueue.push(req);
+        this._processQueue();
+    }
+
+    _processQueue() {
+        if (this.activeRequests >= this.poolSize || this.requestQueue.length === 0) return;
+
+        const req = this.requestQueue.shift();
+        this.activeRequests++;
+
+        this._execute(req)
+            .then(req.resolve)
+            .catch(err => {
+                if (req.retries < this.maxRetries && this._retryable(err)) {
+                    req.retries++;
+                    this.requestQueue.unshift(req);
+                } else {
+                    req.reject(err);
+                }
+            })
+            .finally(() => {
+                this.activeRequests--;
+                setImmediate(() => this._processQueue());
+            });
+    }
+
+    async _execute(req) {
+        const pathname = `/api${req.endpoint}`;
+
+        const body = (req.method !== "GET" && req.method !== "HEAD")
+            ? JSON.stringify(req.data)
+            : null;
+
+        const headers = Object.assign({}, this.baseHeaders);
+
+        if (body) {
+            headers['Content-Length'] = Buffer.byteLength(body);
+        }
+
+        const options = {
+            method: req.method,
+            hostname: this.hostname,
+            port: this.parsedBaseUrl.port,
+            path: pathname,
+            headers: headers,
+            agent: this.isHttps ? this.httpsAgent : this.httpAgent,
+        };
+
+        return new Promise((resolve, reject) => {
+            const start = performance.now();
+
+            const transport = this.isHttps ? https : http;
+            const request = transport.request(options);
+
+            let timer = setTimeout(() => {
+                request.destroy();
+                reject(new Error("Request timeout"));
+            }, this.timeout);
+
+            if (body) {
+                request.end(body);
+            } else {
+                request.end();
+            }
+
+            request.on("error", err => {
+                clearTimeout(timer);
+                this._log(req, start, 0, "ERROR", err.message);
+                reject(err);
+            });
+
+            request.on("response", res => {
+                let chunks = [];
+
+                res.on("data", c => chunks.push(c));
+                res.on("end", () => {
+                    clearTimeout(timer);
+
+                    const raw = Buffer.concat(chunks);
+                    const size = raw.length;
+
+                    let parsed = raw.toString();
+
+                    if (res.headers["content-type"]?.includes("application/json")) {
+                        try {
+                            parsed = JSON.parse(parsed);
+                        } catch (e) { }
+                    }
+
+                    this._log(req, start, size, res.statusCode);
+
+                    if (res.statusCode >= 200 && res.statusCode < 300) {
+                        resolve(parsed);
+                    } else {
+                        console.error("HTTP Error:", req.method, req.endpoint, res.statusCode, parsed);
+                        reject(new Error(`HTTP ${res.statusCode}: ${parsed?.error || parsed}`));
+                    }
+                });
+            });
+        });
+    }
+
+    _retryable(err) {
+        if (!err || !err.message) return false;
+        return (
+            err.message.includes("timeout") ||
+            err.message.includes("ECONNRESET") ||
+            err.message.includes("ECONNREFUSED") ||
+            err.message.includes("EAI_AGAIN")
+        );
+    }
+
+    _log(req, start, size, status, error = null) {
+        const ms = Math.round((performance.now() - start) * 1000) / 1000;
+        const op = req.endpoint.split("/")[2]?.toUpperCase() || "REQUEST";
+
+        if (status === "ERROR") {
+            console.log(
+                `[HTTP] ${op} ${req.endpoint} | Error: ${error} | Duration: ${ms}ms`
+            );
+        } else {
+            console.log(
+                `[HTTP] ${op} | ${req.method} -> ${req.endpoint} | Status: ${status} | Duration: ${ms}ms | Size: ${size}B`
+            );
+        }
+    }
+
+    close() {
+        this.httpAgent.destroy();
+        this.httpsAgent.destroy();
+    }
+}
+
 class LocalAdapter {
     constructor(opts = {}) {
         this.storagePath = opts.storagePath || './storage';
@@ -404,6 +634,8 @@ class LocalAdapter {
         this.saveQueue = new Map();
         this.isSaving = new Set();
         this.saveDelay = opts.saveDelay || 50;
+
+        this.collectionName = null;
 
         try {
             fsSync.mkdirSync(this.storagePath, { recursive: true });
@@ -506,7 +738,7 @@ class LocalAdapter {
         return Array.from(collections);
     }
 
-    _getCollection(name) {
+    _loadCollection(name) {
         if (this.collections.has(name)) {
             return this.collections.get(name);
         }
@@ -517,24 +749,32 @@ class LocalAdapter {
             lastSave: 0,
             idIndex: new Map()
         };
-        this.collections.set(name, col);
 
         const filePath = path.join(this.storagePath, `${name}.json`);
+
         if (fsSync.existsSync(filePath)) {
             try {
                 const raw = fsSync.readFileSync(filePath, 'utf8');
-                const data = JSON.parse(raw) || [];
-                col.data = data;
+                const data = raw.trim() ? JSON.parse(raw) : [];
 
-                data.forEach((doc, idx) => {
-                    if (doc.id) col.idIndex.set(doc.id, idx);
-                });
+                if (Array.isArray(data)) {
+                    col.data = data;
+                    col.idIndex.clear();
+                    for (let i = 0; i < data.length; i++) {
+                        const doc = data[i];
+                        if (doc && doc.id) {
+                            col.idIndex.set(doc.id, i);
+                        }
+                    }
+                }
 
                 col.lastSave = Date.now();
             } catch (e) {
-                console.error("Failed to load collection:", e);
+                console.error(`[LiekoDB] Critical error loading collection "${name}":`, e.message);
             }
         }
+
+        this.collections.set(name, col);
         return col;
     }
 
@@ -580,6 +820,12 @@ class LocalAdapter {
         } catch (error) {
             this._log('Save error:', error);
             col.dirty = true;
+
+            try {
+                const tempPath = path.join(this.storagePath, `${name}.json.tmp`);
+                if (fsSync.existsSync(tempPath)) fsSync.unlinkSync(tempPath);
+            } catch (e) { }
+
             this._scheduleSave(name);
         } finally {
             this.isSaving.delete(name);
@@ -614,21 +860,44 @@ class LocalAdapter {
         return orderedDoc;
     }
 
-    async count(collectionName, filters = {}) {
+    async request(method, endpoint, payload = {}) {
+        const parts = endpoint.split("/").filter(Boolean);
+        // Payload can contains filters, options, data, update
+
+        this.collectionName = parts[1];
+        const param = parts[2];
+
+        if (method === "GET" && !param) return this.find(payload);
+        if (method === "GET" && param === "count") return this.count(payload);
+        if (method === "GET" && param) return this.findById(param);
+
+        if (method === "POST") return this.insert(payload);
+
+        if (method === "PATCH" && param) return this.updateById(param, payload);
+        if (method === "PATCH") return this.update(payload);
+
+        if (method === "DELETE" && param === "drop") return this.dropCollection();
+        if (method === "DELETE" && param) return this.deleteById(param);
+        if (method === "DELETE") return this.delete(payload);
+
+        throw new Error(`Unsupported endpoint: ${method} ${endpoint}`);
+    }
+
+    async count({ filters = {} } = {}) {
         const start = this._startTimer();
-        const col = this._getCollection(collectionName);
+        const col = this._loadCollection(this.collectionName);
         const result = this.queryEngine.count(col.data, filters);
         const duration = this._endTimer(start);
 
         const details = `Filters: ${this._formatFilters(filters)} | Count: ${result}`;
-        this._logRequest('count', collectionName, details, duration, this._getDataSize(result));
+        this._logRequest('count', this.collectionName, details, duration, this._getDataSize(result));
 
         return result;
     }
 
-    async find(collectionName, filters = {}, options = {}) {
+    async find({ filters = {}, options = {} } = {}) {
         const start = this._startTimer();
-        const col = this._getCollection(collectionName);
+        const col = this._loadCollection(this.collectionName);
         let results = this.queryEngine.applyFilters(col.data, filters);
 
         if (options.sort) results = this.queryEngine.sortResults(results, options.sort);
@@ -648,26 +917,49 @@ class LocalAdapter {
 
         const duration = this._endTimer(start);
         const details = `Filters: ${this._formatFilters(filters)}${this._formatOptions(options)} | Found: ${results.length}`;
-        this._logRequest('find', collectionName, details, duration, this._getDataSize(results));
+        this._logRequest('find', this.collectionName, details, duration, this._getDataSize(results));
 
         return results;
     }
 
-    async findById(collectionName, id) {
+    /*
+    async findById(id) {
         const start = this._startTimer();
-        const col = this._getCollection(collectionName);
+        const col = this._loadCollection(this.collectionName);
         const found = col.data.find(d => (d.id && d.id === id));
         const duration = this._endTimer(start);
 
         const details = `ID: ${id} | Found: ${found ? 'Yes' : 'No'}`;
-        this._logRequest('findById', collectionName, details, duration, this._getDataSize(found));
+        this._logRequest('findById', this.collectionName, details, duration, this._getDataSize(found));
 
         return found || null;
+    }*/
+
+    async findById(id) {
+        const start = this._startTimer();
+        const col = this._loadCollection(this.collectionName);
+
+        const idx = col.idIndex.get(id);
+        const found = (idx !== undefined && col.data[idx]) ? col.data[idx] : null;
+
+        const duration = this._endTimer(start);
+        const details = `ID: ${id} | Found: ${found ? 'Yes' : 'No'}`;
+
+        this._logRequest(
+            'findById',
+            this.collectionName,
+            details,
+            duration,
+            this._getDataSize(found)
+        );
+
+        return found;
     }
 
-    async insert(collectionName, data) {
+
+    async insert({ data }) {
         const start = this._startTimer();
-        const col = this._getCollection(collectionName);
+        const col = this._loadCollection(this.collectionName);
         const toInsert = Array.isArray(data) ? data : [data];
         const now = new Date().toISOString();
         const inserted = [];
@@ -724,7 +1016,7 @@ class LocalAdapter {
 
         if (inserted.length > 0 || updated.length > 0) {
             col.dirty = true;
-            this._scheduleSave(collectionName);
+            this._scheduleSave(this.collectionName);
         }
 
         const result = {
@@ -754,14 +1046,14 @@ class LocalAdapter {
         const details = result.updated !== undefined
             ? `Inserted: ${result.inserted}, Updated: ${result.updated}`
             : `Inserted: ${result.inserted}`;
-        this._logRequest('insert', collectionName, details, duration, this._getDataSize(result));
+        this._logRequest('insert', this.collectionName, details, duration, this._getDataSize(result));
 
         return result;
     }
 
-    async update(collectionName, filter, update) {
+    async update({ filters, update }) {
         const start = this._startTimer();
-        const col = this._getCollection(collectionName);
+        const col = this._loadCollection(this.collectionName);
 
         const normalizedUpdate = update.$set || update.$inc || update.$push || update.$pull || update.$unset || update.$addToSet
             ? update
@@ -770,7 +1062,7 @@ class LocalAdapter {
         let updated = 0;
 
         for (let i = 0; i < col.data.length; i++) {
-            if (this.queryEngine.matchesFilter(col.data[i], filter)) {
+            if (this.queryEngine.matchesFilter(col.data[i], filters)) {
                 this.queryEngine.applyUpdateToDoc(col.data[i], normalizedUpdate);
                 updated++;
             }
@@ -778,43 +1070,43 @@ class LocalAdapter {
 
         if (updated > 0) {
             col.dirty = true;
-            this._scheduleSave(collectionName);
+            this._scheduleSave(this.collectionName);
         }
 
         const result = { updated };
         const duration = this._endTimer(start);
-        const details = `Filters: ${this._formatFilters(filter)} | Updated: ${updated}`;
-        this._logRequest('update', collectionName, details, duration, this._getDataSize(result));
+        const details = `Filters: ${this._formatFilters(filters)} | Updated: ${updated}`;
+        this._logRequest('update', this.collectionName, details, duration, this._getDataSize(result));
 
         return result;
     }
 
-    async updateById(collectionName, id, update) {
+    async updateById(id, { update }) {
         const start = this._startTimer();
-        const col = this._getCollection(collectionName);
+        const col = this._loadCollection(this.collectionName);
         const docIndex = col.data.findIndex(d => (d.id && d.id === id));
 
         if (docIndex === -1) {
             const duration = this._endTimer(start);
             const details = `ID: ${id} | Updated: 0`;
-            this._logRequest('updateById', collectionName, details, duration, 0);
+            this._logRequest('updateById', this.collectionName, details, duration, 0);
             return { updated: 0 };
         }
 
         this.queryEngine.applyUpdateToDoc(col.data[docIndex], update);
 
         col.dirty = true;
-        this._scheduleSave(collectionName);
+        this._scheduleSave(this.collectionName);
 
         const result = { updated: 1 };
         const duration = this._endTimer(start);
         const details = `ID: ${id} | Updated: 1`;
-        this._logRequest('updateById', collectionName, details, duration, this._getDataSize(result));
+        this._logRequest('updateById', this.collectionName, details, duration, this._getDataSize(result));
 
         return result;
     }
 
-    async paginate(collectionName, filters = {}, options = {}) {
+    async paginate(filters = {}, options = {}) {
         const start = this._startTimer();
 
         const page = Math.max(1, parseInt(options.page) || 1);
@@ -823,10 +1115,10 @@ class LocalAdapter {
 
         const skip = (page - 1) * limit;
 
-        const totalItems = await this.count(collectionName, filters);
+        const totalItems = await this.count(this.collectionName, filters);
         const totalPages = Math.ceil(totalItems / limit);
 
-        const items = await this.find(collectionName, filters, {
+        const items = await this.find(this.collectionName, filters, {
             sort,
             skip,
             limit
@@ -850,22 +1142,22 @@ class LocalAdapter {
 
         const duration = this._endTimer(start);
         const details = `Filters: ${this._formatFilters(filters)} | Page: ${page}/${totalPages} | Limit: ${limit}`;
-        this._logRequest('paginate', collectionName, details, duration, this._getDataSize(result));
+        this._logRequest('paginate', this.collectionName, details, duration, this._getDataSize(result));
 
         return result;
     }
 
-    async delete(collectionName, filter = {}) {
+    async delete({ filters = {} }) {
         const start = this._startTimer();
-        const col = this._getCollection(collectionName);
+        const col = this._loadCollection(this.collectionName);
         const before = col.data.length;
 
         const idsToDelete = col.data
-            .filter(d => this.queryEngine.matchesFilter(d, filter))
+            .filter(d => this.queryEngine.matchesFilter(d, filters))
             .map(d => d.id)
             .filter(id => id !== undefined);
 
-        col.data = col.data.filter(d => !this.queryEngine.matchesFilter(d, filter));
+        col.data = col.data.filter(d => !this.queryEngine.matchesFilter(d, filters));
         const deleted = before - col.data.length;
 
         if (deleted) {
@@ -876,20 +1168,20 @@ class LocalAdapter {
             });
 
             col.dirty = true;
-            this._scheduleSave(collectionName);
+            this._scheduleSave(this.collectionName);
         }
 
         const result = { deleted };
         const duration = this._endTimer(start);
-        const details = `Filters: ${this._formatFilters(filter)} | Deleted: ${deleted}`;
-        this._logRequest('delete', collectionName, details, duration, this._getDataSize(result));
+        const details = `Filters: ${this._formatFilters(filters)} | Deleted: ${deleted}`;
+        this._logRequest('delete', this.collectionName, details, duration, this._getDataSize(result));
 
         return result;
     }
 
-    async deleteById(collectionName, id) {
+    async deleteById(id) {
         const start = this._startTimer();
-        const col = this._getCollection(collectionName);
+        const col = this._loadCollection(this.collectionName);
         const before = col.data.length;
 
         col.data = col.data.filter(d => !((d.id && d.id === id)));
@@ -898,26 +1190,26 @@ class LocalAdapter {
         if (deleted) {
             col.idIndex.delete(id);
             col.dirty = true;
-            this._scheduleSave(collectionName);
+            this._scheduleSave(this.collectionName);
         }
 
         const result = { deleted };
         const duration = this._endTimer(start);
         const details = `ID: ${id} | Deleted: ${deleted}`;
-        this._logRequest('deleteById', collectionName, details, duration, this._getDataSize(result));
+        this._logRequest('deleteById', this.collectionName, details, duration, this._getDataSize(result));
 
         return result;
     }
 
-    async dropCollection(collectionName) {
-        this.collections.delete(collectionName);
+    async dropCollection() {
+        this.collections.delete(this.collectionName);
 
-        if (this.saveQueue.has(collectionName)) {
-            clearTimeout(this.saveQueue.get(collectionName));
-            this.saveQueue.delete(collectionName);
+        if (this.saveQueue.has(this.collectionName)) {
+            clearTimeout(this.saveQueue.get(this.collectionName));
+            this.saveQueue.delete(this.collectionName);
         }
 
-        const filePath = path.join(this.storagePath, `${collectionName}.json`);
+        const filePath = path.join(this.storagePath, `${this.collectionName}.json`);
         try {
             await fs.unlink(filePath);
         } catch (e) { }
@@ -925,7 +1217,7 @@ class LocalAdapter {
         return { dropped: true };
     }
 
-    async emergencySave() {
+    async saveCollections() {
         for (const timeout of this.saveQueue.values()) {
             clearTimeout(timeout);
         }
@@ -967,7 +1259,7 @@ class LocalAdapter {
     }
 
     async close() {
-        await this.emergencySave();
+        await this.saveCollections();
         return true;
     }
 }
@@ -979,11 +1271,16 @@ class Collection {
     }
 
     async count(filters = {}) {
-        return this.adapter.count(this.name, filters);
+        return this.adapter.request('GET', `/collections/${this.name}/count`, {
+            filters
+        });
     }
 
     async find(filters = {}, options = {}) {
-        return this.adapter.find(this.name, filters, options);
+        return this.adapter.request('GET', `/collections/${this.name}`, {
+            filters,
+            options
+        });
     }
 
     async findOne(filters = {}, options = {}) {
@@ -991,43 +1288,71 @@ class Collection {
         return results && results.length > 0 ? results[0] : null;
     }
 
-    async findById(id) {
-        return this.adapter.findById(this.name, id);
+    async findById(id, options = {}) {
+        return this.adapter.request('GET', `/collections/${this.name}/${id}`, {
+            options
+        });
     }
 
     async insert(data) {
-        return this.adapter.insert(this.name, data);
+        return this.adapter.request('POST', `/collections/${this.name}`, {
+            data
+        });
     }
 
-    async update(filter, update) {
-        return this.adapter.update(this.name, filter, update);
+    async update(filters, update) {
+        return this.adapter.request('PATCH', `/collections/${this.name}`, {
+            filters,
+            update
+        });
     }
 
     async updateById(id, update) {
-        return this.adapter.updateById(this.name, id, update);
+        return this.adapter.request('PATCH', `/collections/${this.name}/${id}`, {
+            update
+        });
     }
 
-    async paginate(filters = {}, options = {}) {
-        return this.adapter.paginate(this.name, filters, options);
+    async paginate(filters, options = {}) {
+        return this.adapter.request('GET', `/collections/${this.name}/paginate`, {
+            filters,
+            options
+        });
     }
 
-    async delete(filter = {}) {
-        return this.adapter.delete(this.name, filter);
+    async delete(filters) {
+        if (!filters) {
+            throw new Error('Delete operation requires filters to prevent accidental deletion of all documents. {} or use .drop() to delete entire collection.');
+        }
+
+        return this.adapter.request('DELETE', `/collections/${this.name}`, {
+            filters
+        });
     }
 
     async deleteById(id) {
-        return this.adapter.deleteById(this.name, id);
+        if (!id) {
+            throw new Error('deleteById operation requires a valid document ID.');
+        }
+        return this.adapter.request('DELETE', `/collections/${this.name}/${id}`);
     }
 
     async drop() {
-        return this.adapter.dropCollection(this.name);
+        return this.adapter.request('DELETE', `/collections/${this.name}/drop`);
     }
 }
 
 class LiekoDB {
     constructor(options = {}) {
         this.debug = options.debug || false;
-        this.adapter = new LocalAdapter(options);
+        this.adapter = this._createAdapter(options);
+    }
+
+    _createAdapter(options) {
+        if (options.token) {
+            return new HTTPAdapter(options);
+        }
+        return new LocalAdapter(options);
     }
 
     _validateCollectionName(name) {
