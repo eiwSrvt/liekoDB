@@ -1,7 +1,7 @@
 {
   "name": "liekodb",
-  "version": "0.0.4",
-  "description": "Lightweight, file-based, MongoDB-like JSON database for Node.js",
+  "version": "0.1.0",
+  "description": "Lightweight, MongoDB-like JSON database for Node.js",
   "main": "liekodb.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1"
@@ -16,7 +16,7 @@
     "nosql",
     "offline"
   ],
-  "author": "Eih3 eih3.prog@gmail.com",
+  "author": "EiwSrvt eiwsrvt@gmail.com",
   "license": "MIT",
   "files": [
     "liekodb.js",
